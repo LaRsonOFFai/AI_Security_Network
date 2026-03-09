@@ -1,0 +1,35 @@
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+/tmp/*
+
+# Sensitive data - DO NOT COMMIT
+tg_config.conf
+ai_config.conf
+blacklist_permanent.txt
+*.key
+*.pem
+.password
+.env
+
+# Runtime data
+ai_state.dat
+threat_database.dat
+learning_database.dat
+/ai_state.dat
+/threat_database.dat
+/learning_database.dat
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
