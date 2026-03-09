@@ -313,11 +313,6 @@ MIT License - см. файл LICENSE
 
 - **AI Security Team** - Initial work
 
-## 🙏 Благодарности
-
-- Fail2Ban за вдохновение
-- Telegram Bot API
-- ip-api.com за геолокацию
 
 ## 📞 Поддержка
 
