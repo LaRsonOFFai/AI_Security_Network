@@ -7,49 +7,67 @@
 # === МОНИТОРИНГ SSH АТАК ===
 monitor_ssh_attacks() {
     local attacks=()
-    
+
     # Неудачные попытки входа
     local failed_logins
     failed_logins=$(sudo grep "Failed password" /var/log/auth.log 2>/dev/null | \
         tail -500 | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' | \
         sort | uniq -c | sort -rn | head -20)
-    
+
     if [[ -n "$failed_logins" ]]; then
         while read -r count ip; do
-            if [[ $count -ge 3 && -n "$ip" ]]; then
+            if [[ -z "$ip" ]]; then
+                continue
+            fi
+            
+            # ПРОВЕРКА НА МГНОВЕННЫЙ БАН
+            if [[ $count -ge 15 ]]; then
+                attacks+=("SSH_INSTANT_BAN|$ip|$count|Massive brute force - instant ban")
+            elif [[ $count -ge 3 ]]; then
                 attacks+=("SSH|$ip|$count|Failed logins")
             fi
         done <<< "$failed_logins"
     fi
-    
+
     # Попытки входа под root
     local root_attempts
     root_attempts=$(sudo grep "for root" /var/log/auth.log 2>/dev/null | \
         tail -200 | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' | \
         sort | uniq -c | sort -rn | head -10)
-    
+
     if [[ -n "$root_attempts" ]]; then
         while read -r count ip; do
-            if [[ $count -ge 2 && -n "$ip" ]]; then
+            if [[ -z "$ip" ]]; then
+                continue
+            fi
+            
+            # Мгновенный бан для root атак
+            if [[ $count -ge 10 ]]; then
+                attacks+=("SSH_ROOT_INSTANT_BAN|$ip|$count|Massive root attack - instant ban")
+            elif [[ $count -ge 2 ]]; then
                 attacks+=("SSH_ROOT|$ip|$count|Root attempts")
             fi
         done <<< "$root_attempts"
     fi
-    
+
     # Invalid users (перебор пользователей)
     local invalid_users
     invalid_users=$(sudo grep "Invalid user" /var/log/auth.log 2>/dev/null | \
         tail -200 | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' | \
         sort | uniq -c | sort -rn | head -10)
-    
+
     if [[ -n "$invalid_users" ]]; then
         while read -r count ip; do
-            if [[ $count -ge 3 && -n "$ip" ]]; then
+            if [[ -z "$ip" ]]; then
+                continue
+            fi
+            
+            if [[ $count -ge 3 ]]; then
                 attacks+=("SSH_INVALID_USER|$ip|$count|Invalid user attempts")
             fi
         done <<< "$invalid_users"
     fi
-    
+
     # Возвращаем результаты
     printf '%s\n' "${attacks[@]}"
 }

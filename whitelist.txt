@@ -1,0 +1,2 @@
+# Whitelist для AI Security System
+# Формат: IP # Комментарий

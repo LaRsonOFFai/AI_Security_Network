@@ -24,6 +24,34 @@ if [[ -f "${SCRIPT_DIR}/tg_config.conf" ]]; then
     source "${SCRIPT_DIR}/tg_config.conf"
 fi
 
+# === ЗАГРУЗКА WHITELIST ===
+declare -A WHITELIST_IPS
+
+load_whitelist() {
+    local whitelist_file="${SCRIPT_DIR}/whitelist.txt"
+    if [[ -f "$whitelist_file" ]]; then
+        while IFS= read -r line; do
+            local ip
+            ip=$(echo "$line" | cut -d'#' -f1 | tr -d ' ')
+            if [[ -n "$ip" ]]; then
+                WHITELIST_IPS["$ip"]=1
+            fi
+        done < "$whitelist_file"
+    fi
+}
+
+# Проверка IP в whitelist
+is_whitelisted() {
+    local ip="$1"
+    if [[ "${WHITELIST_IPS[$ip]:-0}" == "1" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Загружаем whitelist при старте
+load_whitelist
+
 # === КОНФИГУРАЦИЯ ИИ ===
 declare -A IP_REPUTATION
 declare -A IP_ATTACK_HISTORY
@@ -96,42 +124,52 @@ calculate_threat_from_attack() {
     local attack_type="$1"
     local count="$2"
     local ip="$3"
-    
+
     # Базовый вес атаки
     local base_weight="${ATTACK_WEIGHTS[$attack_type]:-10}"
-    
+
     # Умножаем на количество
     local threat_score=$((base_weight * count / 5))
-    
+
     # Добавляем гео-риск
     local geo_info
     geo_info=$(get_geo_info "$ip")
     local country
     country=$(echo "$geo_info" | head -1)
-    
+
     case "$country" in
         "China"|"CN") threat_score=$((threat_score + 20)) ;;
         "Russia"|"RU") threat_score=$((threat_score + 15)) ;;
         "North Korea"|"KP") threat_score=$((threat_score + 30)) ;;
     esac
-    
+
+    # Бонус за тип атаки (root-атаки опаснее)
+    if [[ "$attack_type" == *"ROOT"* ]]; then
+        threat_score=$((threat_score + 15))
+    fi
+
+    # Бонус за быструю атаку
+    if [[ "$attack_type" == *"RAPID"* ]]; then
+        threat_score=$((threat_score + 20))
+    fi
+
     # Нормализация
     if [[ $threat_score -gt 100 ]]; then
         threat_score=100
     fi
-    
-    # Определение уровня
+
+    # Определение уровня (пороги из конфига)
     local level
-    if [[ $threat_score -ge 70 ]]; then
+    if [[ $threat_score -ge ${THRESHOLD_CRITICAL:-70} ]]; then
         level=$THREAT_LEVEL_CRITICAL
-    elif [[ $threat_score -ge 50 ]]; then
+    elif [[ $threat_score -ge ${THRESHOLD_HIGH:-60} ]]; then
         level=$THREAT_LEVEL_HIGH
-    elif [[ $threat_score -ge 30 ]]; then
+    elif [[ $threat_score -ge ${THRESHOLD_MEDIUM:-40} ]]; then
         level=$THREAT_LEVEL_MEDIUM
     else
         level=$THREAT_LEVEL_LOW
     fi
-    
+
     echo "$level:$threat_score"
 }
 
@@ -141,47 +179,158 @@ adaptive_response_v3() {
     local attack_type="$2"
     local threat_level="$3"
     local count="$4"
-    
+
     local response_action=""
     local message=""
-    
-    case $threat_level in
-        $THREAT_LEVEL_LOW)
-            response_action="MONITOR"
-            message="🟡 <b>Низкая угроза</b>
+
+    # === ПРОВЕРКА WHITELIST ===
+    if is_whitelisted "$ip"; then
+        log "INFO" "IP $ip в whitelist - пропускаем"
+        echo "WHITELISTED"
+        return
+    fi
+
+    # === МГНОВЕННЫЙ БАН ===
+    if [[ "${INSTANT_PERMANENT_ENABLED:-true}" == "true" ]]; then
+        if [[ "$attack_type" == *"INSTANT_BAN"* ]]; then
+            response_action="PERMANENT_BAN"
+            if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_INSTANT"
+            fi
+            echo "$ip # $(date '+%Y-%m-%d %H:%M:%S') Type: $attack_type Count: $count Reason: Instant ban" >> "${SCRIPT_DIR}/blacklist_permanent.txt"
+
+            local geo_info
+            geo_info=$(get_geo_info "$ip")
+            message="🚨 <b>МГНОВЕННАЯ БЛОКИРОВКА!</b>
 📍 IP: <code>${ip}</code>
 🔍 Тип: ${attack_type}
-📊 Атак: ${count}"
-            ;;
-        $THREAT_LEVEL_MEDIUM)
-            response_action="TEMP_BAN"
-            if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
-                sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_TEMP"
-            fi
-            message="🟠 <b>Средняя угроза</b>
+📊 Атак: ${count}
+🌍 Страна: ${geo_info}
+♾️ Бан: НАВСЕГДА
+
+Причина: Превышен порог INSTANT_PERMANENT_THRESHOLD"
+
+            send_tg "$message"
+            log "INFO" "Response: $response_action for $ip ($attack_type) - INSTANT BAN"
+            echo "$response_action"
+            return
+        fi
+    fi
+
+    # Получаем настройки из конфига (с дефолтными значениями)
+    local min_permanent=${MIN_ATTACKS_PERMANENT_BAN:-7}
+    local min_long=${MIN_ATTACKS_LONG_BAN:-5}
+    local min_temp=${MIN_ATTACKS_TEMP_BAN:-3}
+    local security_level=${SECURITY_LEVEL:-2}
+
+    # === АГРЕССИВНЫЙ РЕЖИМ (уровень 3) ===
+    if [[ $security_level -eq 3 ]]; then
+        # Снижаем пороги для агрессивного режима
+        min_permanent=$((min_permanent - 2))
+        min_long=$((min_long - 2))
+        min_temp=$((min_temp - 1))
+    fi
+
+    # === МЯГКИЙ РЕЖИМ (уровень 1) ===
+    if [[ $security_level -eq 1 ]]; then
+        # Только мониторинг, никаких блокировок
+        response_action="MONITOR"
+        message="🟡 <b>Низкая угроза (мягкий режим)</b>
+📍 IP: <code>${ip}</code>
+🔍 Тип: ${attack_type}
+📊 Атак: ${count}
+👁️ Только наблюдение"
+        log "INFO" "Response: $response_action for $ip ($attack_type)"
+        echo "$response_action"
+        return
+    fi
+
+    # === СТАНДАРТНЫЙ И АГРЕССИВНЫЙ РЕЖИМЫ ===
+    case $threat_level in
+        $THREAT_LEVEL_LOW)
+            # Проверяем не достигнут ли порог для TEMP_BAN по количеству атак
+            if [[ $count -ge $min_temp ]]; then
+                response_action="TEMP_BAN"
+                if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                    sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_TEMP"
+                fi
+                message="🟠 <b>Средняя угроза (по количеству)</b>
 📍 IP: <code>${ip}</code>
 🔍 Тип: ${attack_type}
 📊 Атак: ${count}
 ⏱️ Бан: 10 минут"
-            ;;
-        $THREAT_LEVEL_HIGH)
-            response_action="LONG_BAN"
-            if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
-                sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_LONG"
+            else
+                response_action="MONITOR"
+                message="🟡 <b>Низкая угроза</b>
+📍 IP: <code>${ip}</code>
+🔍 Тип: ${attack_type}
+📊 Атак: ${count}
+👁️ Наблюдение"
             fi
-            message="🔴 <b>Высокая угроза</b>
+            ;;
+
+        $THREAT_LEVEL_MEDIUM)
+            # Проверяем не достигнут ли порог для LONG_BAN
+            if [[ $count -ge $min_long ]]; then
+                response_action="LONG_BAN"
+                if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                    sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_LONG"
+                fi
+                message="🔴 <b>Высокая угроза (длительная блокировка)</b>
 📍 IP: <code>${ip}</code>
 🔍 Тип: ${attack_type}
 📊 Атак: ${count}
 ⏱️ Бан: 24 часа"
+            else
+                response_action="TEMP_BAN"
+                if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                    sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_TEMP"
+                fi
+                message="🟠 <b>Средняя угроза</b>
+📍 IP: <code>${ip}</code>
+🔍 Тип: ${attack_type}
+📊 Атак: ${count}
+⏱️ Бан: 10 минут"
+            fi
             ;;
+
+        $THREAT_LEVEL_HIGH)
+            # Проверяем не достигнут ли порог для PERMANENT_BAN
+            if [[ $count -ge $min_permanent ]]; then
+                response_action="PERMANENT_BAN"
+                if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                    sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_PERM"
+                fi
+                echo "$ip # $(date '+%Y-%m-%d %H:%M:%S') Type: $attack_type Count: $count" >> "${SCRIPT_DIR}/blacklist_permanent.txt"
+
+                local geo_info
+                geo_info=$(get_geo_info "$ip")
+                message="🚨 <b>КРИТИЧЕСКАЯ УГРОЗА!</b>
+📍 IP: <code>${ip}</code>
+🔍 Тип: ${attack_type}
+📊 Атак: ${count}
+🌍 Страна: ${geo_info}
+♾️ Бан: НАВСЕГДА"
+            else
+                response_action="LONG_BAN"
+                if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
+                    sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_LONG"
+                fi
+                message="🔴 <b>Высокая угроза</b>
+📍 IP: <code>${ip}</code>
+🔍 Тип: ${attack_type}
+📊 Атак: ${count}
+⏱️ Бан: 24 часа"
+            fi
+            ;;
+
         $THREAT_LEVEL_CRITICAL)
             response_action="PERMANENT_BAN"
             if ! sudo iptables -L INPUT -n 2>/dev/null | grep -q "$ip"; then
                 sudo iptables -A INPUT -s "$ip" -j DROP -m comment --comment "AI_V3_PERM"
             fi
-            echo "$ip # $(date '+%Y-%m-%d %H:%M:%S') Type: $attack_type" >> "${SCRIPT_DIR}/blacklist_permanent.txt"
-            
+            echo "$ip # $(date '+%Y-%m-%d %H:%M:%S') Type: $attack_type Count: $count" >> "${SCRIPT_DIR}/blacklist_permanent.txt"
+
             local geo_info
             geo_info=$(get_geo_info "$ip")
             message="🚨 <b>КРИТИЧЕСКАЯ УГРОЗА!</b>
@@ -192,11 +341,12 @@ adaptive_response_v3() {
 ♾️ Бан: НАВСЕГДА"
             ;;
     esac
-    
+
+    # Отправляем уведомление (кроме MONITOR)
     if [[ "$response_action" != "MONITOR" ]]; then
         send_tg "$message"
     fi
-    
+
     log "INFO" "Response: $response_action for $ip ($attack_type)"
     echo "$response_action"
 }
